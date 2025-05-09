@@ -31,10 +31,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def load_image(image_path, transform):
+def load_image(image_path):
     # load image
     image_pil = Image.open(image_path).convert("RGB")  # load image
 
+    transform = T.Compose(
+        [
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
     image, _ = transform(image_pil, None)  # 3, h, w
     return image_pil, image
 
@@ -120,7 +127,7 @@ def save_mask_data(output_dir, stem, image, mask_list, box_list, label_list):
     masked_image = image * mask_np[..., None]
     masked_image = masked_image.squeeze()
     masked_image = cv2.cvtColor(masked_image, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(os.path.join(output_dir, f"{stem}.jpg"), masked_image)
+    cv2.imwrite(os.path.join(output_dir, f"{stem}_obj.jpg"), masked_image)
 
     '''json_data = [{
         'value': value,
@@ -141,50 +148,9 @@ def save_mask_data(output_dir, stem, image, mask_list, box_list, label_list):
     torch.save(mask_list, os.path.join(output_dir, f"{stem}.pt"))'''
 
 
-def process_one(image_path, transform, model, text_prompt, box_threshold, text_threshold, output_dir, device):
-    # load image
-    image_pil, image = load_image(image_path, transform)
-
-    # visualize raw image
-    #image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
-
-    # run grounding dino model
-    boxes_filt, pred_phrases = get_grounding_output(
-        model, image, text_prompt, box_threshold, text_threshold, device=device
-    )
-
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    predictor.set_image(image)
-
-    size = image_pil.size
-    H, W = size[1], size[0]
-    for i in range(boxes_filt.size(0)):
-        boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
-        boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
-        boxes_filt[i][2:] += boxes_filt[i][:2]
-
-    boxes_filt = boxes_filt.cpu()
-    if boxes_filt.size(0) <= 0:
-        fail_log.write(f"{image_path}\n")
-        return
-
-    transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
-
-    masks, _, _ = predictor.predict_torch(
-        point_coords = None,
-        point_labels = None,
-        boxes = transformed_boxes.to(device),
-        multimask_output = False,
-    )
-    masks = torch.any(masks, dim=0, keepdim=True)
-
-    stem = image_path.split("/")[-1].split(".")[0]
-    save_mask_data(output_dir, stem, image, masks, boxes_filt, pred_phrases)
-
-
 if __name__ == "__main__":
     fail_log = open("failed.log", "w")
+
 
     parser = argparse.ArgumentParser("Grounded-Segment-Anything Demo", add_help=True)
     parser.add_argument("--config", type=str, required=True, help="path to config file")
@@ -243,26 +209,56 @@ if __name__ == "__main__":
     else:
         predictor = SamPredictor(sam_model_registry[sam_version](checkpoint=sam_checkpoint).to(device))
 
-    transform = T.Compose(
-        [
-            T.RandomResize([800], max_size=1333),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ]
-    )
+    for image_path in tqdm.tqdm(glob.glob("/data/oxford_102_flower/images/*.jpg")):
+        # load image
+        image_pil, image = load_image(image_path)
 
-    prompt_map = {}
-    with open("/data/imagenet/labels.txt", "r") as fp:
-        for line in fp:
-            cat_name = line[:9]
-            prompt = line[10:]
-            prompt_map[cat_name] = prompt
+        # visualize raw image
+        #image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
 
-    for directory in tqdm.tqdm(glob.glob("/data/imagenet/train/jpeg/n01*")):
-        if not os.path.isdir(directory):
+        # run grounding dino model
+        boxes_filt, pred_phrases = get_grounding_output(
+            model, image, text_prompt, box_threshold, text_threshold, device=device
+        )
+
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        predictor.set_image(image)
+
+        size = image_pil.size
+        H, W = size[1], size[0]
+        for i in range(boxes_filt.size(0)):
+            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+            boxes_filt[i][2:] += boxes_filt[i][:2]
+
+        boxes_filt = boxes_filt.cpu()
+        if boxes_filt.size(0) <= 0:
+            fail_log.write(f"{image_path}, {boxes_filt.shape}")
             continue
-        cat = directory.split("/")[-1]
-        for image_path in glob.glob(f"{directory}/*"):
-            odir = f"{output_dir}/{cat}"
-            os.makedirs(odir, exist_ok=True)
-            process_one(image_path, transform, model, prompt_map[cat], box_threshold, text_threshold, odir, device)
+        transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
+
+        masks, _, _ = predictor.predict_torch(
+            point_coords = None,
+            point_labels = None,
+            boxes = transformed_boxes.to(device),
+            multimask_output = False,
+        )
+        masks = torch.any(masks, dim=0, keepdim=True)
+
+        # draw output image
+        '''plt.figure(figsize=(10, 10))
+        plt.imshow(image)
+        for mask in masks:
+            show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
+        for box, label in zip(boxes_filt, pred_phrases):
+            show_box(box.numpy(), plt.gca(), label)
+
+        plt.axis('off')
+        plt.savefig(
+            os.path.join(output_dir, stem + ".jpg"),
+            bbox_inches="tight", dpi=300, pad_inches=0.0
+        )'''
+
+        stem = image_path.split("/")[-1].split(".")[0]
+        save_mask_data(output_dir, stem, image, masks, boxes_filt, pred_phrases)
